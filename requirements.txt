@@ -1,9 +1,9 @@
 streamlit
-python-dotenv
-pypdf
-requests
 langchain
 langchain-community
 langchain-groq
+faiss-cpu
 sentence-transformers
-chromadb
+pypdf
+python-dotenv
+requests
