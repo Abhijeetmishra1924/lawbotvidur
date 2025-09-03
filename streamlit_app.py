@@ -1,37 +1,34 @@
 # app.py
-# ✅ Vidur Bot: Streamlit + LangChain + Groq Backend (Multi-language + PDF Upload & Safe Auto-Remove)
+# ✅ Vidur Bot: Streamlit + LangChain + Groq Backend (Multi-language + PDF Upload with FAISS)
 
 import streamlit as st
-import os, urllib.parse, requests
+import os, urllib.parse, requests, shutil
 import pypdf
-from dotenv import load_dotenv
 
 # LangChain imports
 from langchain_groq import ChatGroq
 from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # =============================
-# Load API Keys (from secrets/env)
+# Load API Keys securely
 # =============================
-load_dotenv()
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
-YOUTUBE_API_KEY = st.secrets.get("YOUTUBE_API_KEY", os.getenv("YOUTUBE_API_KEY"))
+GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+YOUTUBE_API_KEY = st.secrets["YOUTUBE_API_KEY"]
 
 # =============================
 # Directory setup
 # =============================
 dev_data_dir = "data"        # permanent PDFs (developer-added)
 user_data_dir = "user_data"  # temporary PDFs (user uploads)
-persist_path = "chroma_db"
+faiss_index_path = "faiss_index"
 
 os.makedirs(dev_data_dir, exist_ok=True)
 os.makedirs(user_data_dir, exist_ok=True)
-os.makedirs(persist_path, exist_ok=True)
 
 # =============================
 # Initialize LLM
@@ -43,35 +40,49 @@ llm = ChatGroq(
 )
 
 # =============================
-# Setup Vector DB (RAG with dev PDFs only)
+# Setup Embeddings
 # =============================
-def load_vector_db():
-    if not os.path.exists(os.path.join(persist_path, "chroma.sqlite3")):
-        loader = DirectoryLoader(dev_data_dir, glob="*.pdf", loader_cls=PyPDFLoader)
-        documents = loader.load()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        texts = splitter.split_documents(documents)
-        embeddings = HuggingFaceBgeEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        vector_db = Chroma.from_documents(texts, embeddings, persist_directory=persist_path)
-        vector_db.persist()
-    else:
-        embeddings = HuggingFaceBgeEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        vector_db = Chroma(persist_directory=persist_path, embedding_function=embeddings)
+embeddings = HuggingFaceBgeEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# =============================
+# Build / Load FAISS Vector DB
+# =============================
+def build_faiss_index():
+    """Rebuild FAISS index from dev + user PDFs"""
+    all_docs = []
+    for folder in [dev_data_dir, user_data_dir]:
+        loader = DirectoryLoader(folder, glob="*.pdf", loader_cls=PyPDFLoader)
+        docs = loader.load()
+        all_docs.extend(docs)
+
+    if not all_docs:
+        return None
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    texts = splitter.split_documents(all_docs)
+
+    vector_db = FAISS.from_documents(texts, embeddings)
+    vector_db.save_local(faiss_index_path)
     return vector_db
 
-vector_db = load_vector_db()
-retriever = vector_db.as_retriever()
+def load_faiss_index():
+    if os.path.exists(faiss_index_path):
+        return FAISS.load_local(faiss_index_path, embeddings, allow_dangerous_deserialization=True)
+    else:
+        return build_faiss_index()
+
+vector_db = load_faiss_index()
+retriever = vector_db.as_retriever() if vector_db else None
 
 # =============================
 # YouTube fetcher
 # =============================
 def fetch_youtube(query):
-    if not YOUTUBE_API_KEY:
-        return []
     query += " According to Indian law"
     url = (
-        f"https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=5"
-        f"&q={urllib.parse.quote(query)}&key={YOUTUBE_API_KEY}&type=video&regionCode=IN"
+        f"https://www.googleapis.com/youtube/v3/search?"
+        f"part=snippet&maxResults=5&q={urllib.parse.quote(query)}"
+        f"&key={YOUTUBE_API_KEY}&type=video&regionCode=IN"
     )
     try:
         response = requests.get(url)
@@ -93,31 +104,33 @@ st.write("Ask legal questions and get responses based on Indian law.")
 # Upload PDF (user only)
 uploaded_file = st.file_uploader("📄 Upload a legal PDF", type=["pdf"])
 
-# Manage uploaded user file
 pdf_text = ""
-user_pdf_path = None
-
-if uploaded_file is not None:
+if uploaded_file:
     user_pdf_path = os.path.join(user_data_dir, uploaded_file.name)
-    if not os.path.exists(user_pdf_path):  # save only if new
-        with open(user_pdf_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        st.success("✅ PDF uploaded and text extracted!")
 
+    # Save uploaded file
+    with open(user_pdf_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    # Extract text for context
     try:
         reader = pypdf.PdfReader(user_pdf_path)
         pdf_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        st.success("✅ PDF uploaded and text extracted!")
     except Exception as e:
         st.error(f"❌ Failed to read PDF: {e}")
 
-else:
-    # If user removes file → delete only from user_data folder
-    for f in os.listdir(user_data_dir):
-        try:
-            os.remove(os.path.join(user_data_dir, f))
-        except:
-            pass
-    pdf_text = ""
+    # Rebuild FAISS with new PDF
+    vector_db = build_faiss_index()
+    retriever = vector_db.as_retriever() if vector_db else None
+
+# Delete uploaded PDFs if user clears uploader
+elif not uploaded_file:
+    if os.listdir(user_data_dir):  # only clear user PDFs
+        shutil.rmtree(user_data_dir)
+        os.makedirs(user_data_dir, exist_ok=True)
+        vector_db = build_faiss_index()
+        retriever = vector_db.as_retriever() if vector_db else None
 
 # =============================
 # User input
@@ -128,6 +141,8 @@ user_question = st.text_area("❓ Ask your legal question")
 if st.button("Ask Vidur Bot"):
     if not user_question and not pdf_text:
         st.warning("⚠️ Please enter a question or upload a PDF.")
+    elif not retriever:
+        st.error("❌ No knowledge base available. Please upload or add PDFs.")
     else:
         # Prepare input
         final_input = user_question
